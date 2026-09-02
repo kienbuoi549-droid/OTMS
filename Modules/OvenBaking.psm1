@@ -1,0 +1,825 @@
+﻿# ================================================================
+# OvenBaking.psm1 -- HÀM LIÊN QUAN ĐẾN VÙNG HIỂN THỊ GIAO DIỆN OVEN LÒ NƯỚNG (Section 3)
+# Dự án: OTMSAnalyzer V10 -- WPF / PowerShell 5.1
+# ================================================================
+
+# ── Tính và định dạng số lượng Magaziner từ tổng số panel/mpanel ──
+# Ví dụ: 26 → "3,2 MAG" | 8 → "1,0 MAG" | 3 → "0,3 MAG"
+function DINH_DANG_MAG([int]$count) {
+    try {
+        $full = [Math]::Floor($count / 8)
+        $rem  = $count % 8
+        return "${full},${rem} MAG"
+
+    } catch {
+        GHI_LOG "Lỗi hàm DINH_DANG_MAG: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
+}
+
+# ── Đổi chuỗi thuộc tính XML sang số nguyên AN TOÀN -- thuộc tính thiếu/rỗng/ký tự lạ
+# trả về giá trị mặc định thay vì ném exception. TRƯỚC ĐÂY dùng [int]$mp.GetAttribute('sip')
+# trực tiếp: chỉ cần 1 Mpanel/Panel trong Active.db thiếu thuộc tính sip (hoặc rỗng --
+# [int]'' ném lỗi) là exception ném ra giữa chừng, KHÔNG có oven nào sau vị trí đó được
+# xử lý, card lò hiển thị thiếu/thậm chí toàn bộ LAM_MOI_DU_LIEU_LO báo thất bại.
+function DOI_INT_AN_TOAN([string]$chuoi, [int]$macDinh = 0) {
+    try {
+        $kq = 0
+        if (-not [string]::IsNullOrWhiteSpace($chuoi) -and [int]::TryParse($chuoi, [ref]$kq)) { return $kq }
+        return $macDinh
+    } catch { return $macDinh }
+}
+
+# ── Phân tích nội dung lò nướng để tạo dữ liệu cho cửa sổ popup ──
+# Kết quả: @{ totalMag="X,Y MAG"; totalSip=N; models=@(...) }
+# Mỗi model: @{ id; mag; configs: @{ code; mag; sip } }
+# Lưu ý: $node là <o:Oven> (Active.db không có thẻ Batch, Items nằm thẳng trong Oven)
+function XAY_DUNG_CHI_TIET_LO($node, $nsm) {
+    try {
+        # Gom tất cả Mpanel + Panel → nhóm theo model → nhóm theo cấu hình (config)
+        # Cấu trúc: { mã model → { mã cấu hình → @{số lượng; tổng SIP} } }
+        $modelMap  = [ordered]@{}
+        $grandCount= 0
+        $grandSip  = 0
+        # V2.4: đếm số MAGAZINER (kệ) THẬT có trong lò -- MiniMap hiển thị cột "MAG" theo
+        # số kệ này. Mỗi kệ Magaziner có thể chứa nhiều Mpanel nên phải đếm theo NODE kệ,
+        # không thể chia tổng panel cho 8 như DINH_DANG_MAG (đơn vị hàng hoá, không phải
+        # đơn vị kệ vật lý). Nếu file không có node Magaziner (dữ liệu ghi thẳng Mpanel)
+        # thì ESTIMATE = ceil(tổng panel / 8) để vẫn có con số hợp lý.
+        $magCount  = 0
+
+        # Duyệt các Mpanel nằm trong Magaziner
+        $mpNodes = $node.SelectNodes('o:Items/o:Magaziner/o:Mpanel', $nsm)
+        # V2.4: đếm node Magaziner vật lý (trước khi duyệt Mpanel -- cùng XPath cha)
+        $magNodes = $node.SelectNodes('o:Items/o:Magaziner', $nsm)
+        $magCount = $magNodes.Count
+        foreach ($mp in $mpNodes) {
+            $model  = $mp.GetAttribute('model')
+            $cfg    = $mp.GetAttribute('config')
+            # FIX: parse an toàn thay vì [int] ép trực tiếp -- thuộc tính thiếu/rỗng trước
+            # đây làm exception ném giữa chừng, cả danh sách oven bị bỏ lỡ lần cập nhật.
+            $sip    = DOI_INT_AN_TOAN ($mp.GetAttribute('sip'))
+            if (-not $modelMap.Contains($model)) { $modelMap[$model] = [ordered]@{} }
+            if (-not $modelMap[$model].Contains($cfg)) { $modelMap[$model][$cfg] = @{count=0;sip=0} }
+            $modelMap[$model][$cfg].count++
+            $modelMap[$model][$cfg].sip += $sip
+            $grandCount++; $grandSip += $sip
+        }
+        # Duyệt các Panel lẻ (nằm thẳng trong Items, không qua Magaziner)
+        $pNodes = $node.SelectNodes('o:Items/o:Panel', $nsm)
+        foreach ($p in $pNodes) {
+            $model = $p.GetAttribute('model')
+            $cfg   = $p.GetAttribute('config')
+            # FIX: parse an toàn -- cùng lý do với Mpanel ở trên.
+            $sip   = DOI_INT_AN_TOAN ($p.GetAttribute('sip'))
+            if (-not $modelMap.Contains($model)) { $modelMap[$model] = [ordered]@{} }
+            if (-not $modelMap[$model].Contains($cfg)) { $modelMap[$model][$cfg] = @{count=0;sip=0} }
+            $modelMap[$model][$cfg].count++
+            $modelMap[$model][$cfg].sip += $sip
+            $grandCount++; $grandSip += $sip
+        }
+
+        # Tạo danh sách model từ dữ liệu đã thu thập
+        $modelsArr = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($mid in $modelMap.Keys) {
+            $mCount = 0
+            $mSip   = 0
+            $cfgArr = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($cfg in $modelMap[$mid].Keys) {
+                $cd = $modelMap[$mid][$cfg]
+                $mCount += $cd.count
+                $mSip   += $cd.sip
+                $cfgArr.Add(@{
+                    code = $cfg
+                    mag  = DINH_DANG_MAG $cd.count
+                    sip  = "$(DINH_DANG_SO $cd.sip) SIP"
+                }) | Out-Null
+            }
+            $modelsArr.Add(@{
+                id      = $mid
+                mag     = DINH_DANG_MAG $mCount
+                sip     = "$(DINH_DANG_SO $mSip) SIP"
+                sipRaw  = $mSip        # V2.4: số thô tổng SIP của model (MiniMap dùng)
+                configs = @($cfgArr)
+            }) | Out-Null
+        }
+
+        # V2.4: không có node Magaziner nào nhưng vẫn có panel -> ước lượng số kệ
+        if ($magCount -eq 0 -and $grandCount -gt 0) { $magCount = [Math]::Ceiling($grandCount / 8.0) }
+
+        return @{
+            totalMag    = DINH_DANG_MAG $grandCount
+            totalSip    = "$(DINH_DANG_SO $grandSip) SIP"
+            totalSipRaw = $grandSip   # Số thô (chưa format) -- dùng để CỘNG DỒN tổng SIP toàn card
+            totalCount  = $grandCount
+            magCount    = $magCount   # V2.4: số kệ Magaziner vật lý trong lò (MiniMap cột MAG)
+            models      = @($modelsArr)
+        }
+
+    } catch {
+        GHI_LOG "Lỗi hàm XAY_DUNG_CHI_TIET_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
+}
+
+# ── V2.4 -- Phân tích nội dung lò trong FILE LỊCH SỬ (yyyymmdd.db) để tạo dữ liệu popup
+# Kết quả: cùng cấu trúc với XAY_DUNG_CHI_TIET_LO (totalMag/totalSip/totalSipRaw/
+# totalCount/magCount/models), khác ở đường dẫn XPath: file lịch sử có thêm tầng
+# Batch/cycle giữa Oven và Items, nên phải quét Mpanel/Panel bằng descendant (.//)
+# thay vì con trực tiếp -- bao trùm CẢ trường hợp Items nằm thẳng trong Oven.
+# V2.5 -- tham số $MocHoanThanh (tuỳ chọn): DỮ LIỆU THẬT 20260830.db cho thấy mỗi Oven
+# chứa 3-4 Batch (cycle 1..N) và Batch được ghi khi vào COOLING với finish là MỐC DỰ
+# KIẾN CÓ THỂ Ở TƯƠNG LAI (vd lô cuối ca đêm finish 07:49 sáng hôm sau). Khi truyền mốc
+# (Get-Date của lần cập nhật), CHỈ cộng dồn các Batch ĐÃ HOÀN THÀNH (finish <= mốc) --
+# đúng ngữ nghĩa "OVEN HOÀN THÀNH GẦN NHẤT": hàng còn trong lò KHÔNG tính vào tổng.
+# Batch thiếu/không parse được finish -> coi là đã xong (tính, an toàn).
+function XAY_DUNG_CHI_TIET_LO_LICH_SU($node, $nsm, $MocHoanThanh = $null) {
+    try {
+        $modelMap  = [ordered]@{}
+        $grandCount= 0
+        $grandSip  = 0
+        $magCount  = 0
+
+        # V2.5: dựng danh sách phạm vi quét -- MỖI Batch ĐÃ XONG là 1 phạm vi; nếu Oven
+        # không có Batch nào (cấu trúc phẳng, Items thẳng trong Oven) thì quét cả Oven.
+        $phamVis  = @()
+        $batNodes = $node.SelectNodes('.//o:Batch', $nsm)
+        if ($batNodes.Count -gt 0) {
+            foreach ($bn in $batNodes) {
+                if ($MocHoanThanh) {
+                    $rawF = $bn.GetAttribute('finish')
+                    if (-not [string]::IsNullOrWhiteSpace($rawF)) {
+                        $fb = [datetime]::MinValue
+                        if ([datetime]::TryParse($rawF, [ref]$fb) -and $fb -gt $MocHoanThanh) { continue }
+                    }
+                }
+                $phamVis += $bn
+            }
+        } else {
+            $phamVis += $node
+        }
+
+        foreach ($phamVi in $phamVis) {
+            # Mpanel: con của Magaziner ở BẤT KỲ tầng nào dưới phạm vi quét (qua Batch)
+            $mpNodes  = $phamVi.SelectNodes('.//o:Magaziner/o:Mpanel', $nsm)
+            $magNodes = $phamVi.SelectNodes('.//o:Magaziner', $nsm)
+            $magCount += $magNodes.Count
+            foreach ($mp in $mpNodes) {
+                $model = $mp.GetAttribute('model')
+                $cfg   = $mp.GetAttribute('config')
+                $sip   = DOI_INT_AN_TOAN ($mp.GetAttribute('sip'))
+                if (-not $modelMap.Contains($model)) { $modelMap[$model] = [ordered]@{} }
+                if (-not $modelMap[$model].Contains($cfg)) { $modelMap[$model][$cfg] = @{count=0;sip=0} }
+                $modelMap[$model][$cfg].count++
+                $modelMap[$model][$cfg].sip += $sip
+                $grandCount++; $grandSip += $sip
+            }
+            # Panel lẻ: ở bất kỳ tầng nào (Items thẳng trong Oven HOẶC trong Batch)
+            $pNodes = $phamVi.SelectNodes('.//o:Panel', $nsm)
+            foreach ($p in $pNodes) {
+                $model = $p.GetAttribute('model')
+                $cfg   = $p.GetAttribute('config')
+                $sip   = DOI_INT_AN_TOAN ($p.GetAttribute('sip'))
+                if (-not $modelMap.Contains($model)) { $modelMap[$model] = [ordered]@{} }
+                if (-not $modelMap[$model].Contains($cfg)) { $modelMap[$model][$cfg] = @{count=0;sip=0} }
+                $modelMap[$model][$cfg].count++
+                $modelMap[$model][$cfg].sip += $sip
+                $grandCount++; $grandSip += $sip
+            }
+        }
+
+        $modelsArr = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($mid in $modelMap.Keys) {
+            $mCount = 0
+            $mSip   = 0
+            $cfgArr = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($cfg in $modelMap[$mid].Keys) {
+                $cd = $modelMap[$mid][$cfg]
+                $mCount += $cd.count
+                $mSip   += $cd.sip
+                $cfgArr.Add(@{
+                    code = $cfg
+                    mag  = DINH_DANG_MAG $cd.count
+                    sip  = "$(DINH_DANG_SO $cd.sip) SIP"
+                }) | Out-Null
+            }
+            $modelsArr.Add(@{
+                id      = $mid
+                mag     = DINH_DANG_MAG $mCount
+                sip     = "$(DINH_DANG_SO $mSip) SIP"
+                sipRaw  = $mSip
+                configs = @($cfgArr)
+            }) | Out-Null
+        }
+
+        if ($magCount -eq 0 -and $grandCount -gt 0) { $magCount = [Math]::Ceiling($grandCount / 8.0) }
+
+        return @{
+            totalMag    = DINH_DANG_MAG $grandCount
+            totalSip    = "$(DINH_DANG_SO $grandSip) SIP"
+            totalSipRaw = $grandSip
+            totalCount  = $grandCount
+            magCount    = $magCount
+            models      = @($modelsArr)
+        }
+
+    } catch {
+        GHI_LOG "Lỗi hàm XAY_DUNG_CHI_TIET_LO_LICH_SU: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+        return @{ totalMag='0,0 MAG'; totalSip='0 SIP'; totalSipRaw=0; totalCount=0; magCount=0; models=@() }
+    }
+}
+
+# ── V2.4 -- Xác định thời điểm HOÀN THÀNH của 1 node Oven trong file lịch sử.
+# File lịch sử có thể chứa mốc finish ở nhiều vị trí tuỳ cách hệ thống nguồn ghi:
+#   1) thuộc tính 'finish' ngay trên Oven          (quy ước giống Active.db -- ưu tiên 1)
+#   2) thuộc tính 'finishTime' trên Oven           (phương án tên khác)
+#   3) mốc finish muộn nhất trên các node Batch/cycle con (finish/finishTime/endTime)
+# V2.5 -- tham số $MocToiDa (tuỳ chọn): khi truyền mốc (Get-Date), MỌI mốc VƯỢT TƯƠNG
+# LAI bị bỏ qua -- Batch trong dữ liệu thật được ghi khi vào COOLING với finish DỰ KIẾN
+# (có thể 07:49 sáng hôm sau), lò đang nướng dở KHÔNG được chọn làm "hoàn thành gần
+# nhất". Trả về DateTime; KHÔNG tìm thấy mốc hợp lệ -> [datetime]::MinValue (nơi gọi tự
+# bỏ qua).
+function LAY_THOI_GIAN_HOAN_THANH_LO($node, $nsm, $MocToiDa = $null) {
+    try {
+        $dt = [datetime]::MinValue
+
+        # 1+2) mốc ngay trên Oven
+        $raw = $node.GetAttribute('finish')
+        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $node.GetAttribute('finishTime') }
+        if (-not [string]::IsNullOrWhiteSpace($raw) -and [datetime]::TryParse($raw, [ref]$dt)) {
+            if (-not $MocToiDa -or $dt -le $MocToiDa) { return $dt }
+        }
+
+        # 3) quét các Batch/cycle con -- lấy mốc MUỘN NHẤT (lô cuối cùng TRONG lò, KHÔNG
+        #    VƯỢT $MocToiDa nếu có truyền mốc)
+        $maxDt = [datetime]::MinValue
+        foreach ($bn in $node.SelectNodes('.//o:Batch', $nsm)) {
+            foreach ($attr in @('finish','finishTime','endTime')) {
+                $rb = $bn.GetAttribute($attr)
+                if (-not [string]::IsNullOrWhiteSpace($rb) -and [datetime]::TryParse($rb, [ref]$dt) -and $dt -gt $maxDt) {
+                    if ($MocToiDa -and $dt -gt $MocToiDa) { continue }
+                    $maxDt = $dt
+                }
+            }
+        }
+        return $maxDt
+
+    } catch {
+        GHI_LOG "Lỗi hàm LAY_THOI_GIAN_HOAN_THANH_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+        return [datetime]::MinValue
+    }
+}
+
+# ── V2.6 -- Đọc yyyymmdd.db của ca đang chạy, tìm BATCH có finish GẦN NHẤT (muộn nhất
+# nhưng KHÔNG VƯỢT hiện tại) theo từng loại lò (MiniMap: section "OVEN HOÀN THÀNH
+# GẦN NHẤT" -- nguồn dữ liệu yyyymmdd.db).
+# V2.4/V2.5 (cũ): chọn OVEN hoàn thành gần nhất rồi cộng dồn TOÀN BỘ batch đã xong
+# trong lò đó -> tổng SIP/MAG bị phình to bởi các batch ĐÃ RA TỪ TRƯỚC trong cùng lò.
+# V2.6 (yêu cầu nghiệp vụ): "lò đã xong" phải lấy thông tin ĐÚNG BATCH có finish gần
+# nhất -- 1 lò nướng 3-4 lô (Batch/cycle), lô ra CUỐI cùng mới là mốc "lò xong"; giờ
+# hoàn thành + tổng SIP/MAG hiển thị đều thuộc về batch đó (batch cũ hơn KHÔNG cộng).
+# Trả về hashtable: { mã loại lò -> @{ id; batchId; cycle; fRaw; finish; totalSip;
+# totalSipRaw; totalMag; magCount; totalCount } }
+#   id      = mã OVEN chứa batch được chọn (hiển thị chính trên MiniMap)
+#   batchId = id node Batch (vd C10.5-00469-01-01), cycle = số lô trong lò
+# File không tồn tại/đọc thất bại -> hashtable rỗng (KHÔNG ném exception -- phần lịch sử
+# thiếu chỉ làm section hiển thị trống, không được ảnh hưởng dữ liệu Active.db).
+# DỰ PHÒNG: nếu loại lò KHÔNG có Batch nào mang mốc finish hợp lệ (cấu trúc khác --
+# Items thẳng trong Oven hoặc finish ghi trên Oven) -> quay về logic V2.5 chọn OVEN
+# hoàn thành gần nhất để section không bị trống vô nghĩa.
+function LAY_DU_LIEU_LICH_SU_LO {
+    try {
+        $ketQua = @{}
+        $doc = NAP_DB_LICH_SU_NGAY
+        if (-not $doc) { return $ketQua }
+
+        $nsm = [System.Xml.XmlNamespaceManager]::new($doc.NameTable)
+        $nsm.AddNamespace('o', 'urn:otms')
+
+        # V2.5: chốt MỘC thời gian ĐÚNG 1 LẦN đầu hàm -- mọi so sánh "đã hoàn thành" dùng
+        # chung mốc này cho nhất quán (không lệch khi quét chạm ranh đổi giây). Dữ liệu
+        # thật cho thấy Batch được ghi khi vào COOLING với finish DỰ KIẾN có thể ở tương
+        # lai (vd lô cuối ca đêm finish 07:49 sáng hôm sau) -- batch CHƯA tới mốc ra lò
+        # KHÔNG được chọn làm "hoàn thành gần nhất".
+        $fHienTai = Get-Date
+
+        foreach ($cardType in (LAY_DANH_SACH_LOAI_LO)) {
+            if ([string]::IsNullOrWhiteSpace($cardType)) { continue }
+
+            # ══ V2.6: quét MỌI Batch của TẤT CẢ oven cùng loại (trọn CẢ 2 Shift D+N cùng
+            # file) -> giữ batch có mốc finish MUỘN NHẤT nhưng KHÔNG VƯỢT HIỆN TẠI.
+            # Mốc finish có thể nằm ở nhiều tên thuộc tính tuỳ cách hệ thống nguồn ghi:
+            # finish / finishTime / endTime (dữ liệu thật dùng 'finish').
+            $batChon  = $null
+            $ovChon   = $null
+            $fMoiNhat = [datetime]::MinValue
+            foreach ($ov in $doc.SelectNodes("//o:Oven[@type='$cardType']", $nsm)) {
+                foreach ($bn in $ov.SelectNodes('.//o:Batch', $nsm)) {
+                    foreach ($attr in @('finish','finishTime','endTime')) {
+                        $rb = $bn.GetAttribute($attr)
+                        if ([string]::IsNullOrWhiteSpace($rb)) { continue }
+                        $fb = [datetime]::MinValue
+                        if (-not [datetime]::TryParse($rb, [ref]$fb)) { continue }
+                        if ($fb -gt $fHienTai) { continue }   # lô dự kiến CHƯA ra -- bỏ
+                        if ($fb -le $fMoiNhat) { continue }   # không mới hơn batch đang giữ
+                        $fMoiNhat = $fb
+                        $batChon  = $bn
+                        $ovChon   = $ov
+                    }
+                }
+            }
+
+            if ($batChon) {
+                # Chi tiết (SIP/MAG/model) scoped ĐÚNG batch được chọn -- gọi
+                # XAY_DUNG_CHI_TIET_LO_LICH_SU với node Batch: .//Batch con = rỗng
+                # -> hàm tự quét đúng phạm vi CHÍNH batch này, không tràn ra batch khác.
+                $det = XAY_DUNG_CHI_TIET_LO_LICH_SU $batChon $nsm $fHienTai
+                $maLo = $ovChon.GetAttribute('id')
+                if ([string]::IsNullOrWhiteSpace($maLo)) { $maLo = $batChon.GetAttribute('id') }
+                $ketQua[$cardType] = @{
+                    id          = $maLo
+                    batchId     = $batChon.GetAttribute('id')
+                    cycle       = $batChon.GetAttribute('cycle')
+                    fRaw        = $fMoiNhat
+                    finish      = $fMoiNhat.ToString('HH:mm') + ' ' + $fMoiNhat.Day + '/' + $fMoiNhat.Month
+                    totalSip    = $det.totalSip
+                    totalSipRaw = $det.totalSipRaw
+                    totalMag    = $det.totalMag
+                    magCount    = $det.magCount
+                    totalCount  = $det.totalCount
+                }
+                continue
+            }
+
+            # ── DỰ PHÒNG (cấu trúc khác: không có Batch nào mang mốc finish hợp lệ):
+            # logic V2.5 -- chọn OVEN hoàn thành gần nhất (mốc trên Oven hoặc batch con
+            # muộn nhất, vẫn lọc không vượt hiện tại).
+            $loMoiNhat = $null
+            $fLo       = [datetime]::MinValue
+            foreach ($ov in $doc.SelectNodes("//o:Oven[@type='$cardType']", $nsm)) {
+                $f = LAY_THOI_GIAN_HOAN_THANH_LO $ov $nsm $fHienTai
+                if ($f -ne [datetime]::MinValue -and $f -gt $fLo) {
+                    $fLo       = $f
+                    $loMoiNhat = $ov
+                }
+            }
+            if (-not $loMoiNhat) { continue }
+
+            $det = XAY_DUNG_CHI_TIET_LO_LICH_SU $loMoiNhat $nsm $fHienTai
+            $ketQua[$cardType] = @{
+                id          = $loMoiNhat.GetAttribute('id')
+                batchId     = ''
+                cycle       = ''
+                fRaw        = $fLo
+                finish      = $fLo.ToString('HH:mm') + ' ' + $fLo.Day + '/' + $fLo.Month
+                totalSip    = $det.totalSip
+                totalSipRaw = $det.totalSipRaw
+                totalMag    = $det.totalMag
+                magCount    = $det.magCount
+                totalCount  = $det.totalCount
+            }
+        }
+        return $ketQua
+
+    } catch {
+        GHI_LOG "Lỗi hàm LAY_DU_LIEU_LICH_SU_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+        return @{}
+    }
+}
+
+# ── V2.4 -- Chọn oven "ĐANG THEO DÕI" của 1 card cho MiniMap (nguồn Active.db):
+# oven có giờ hoàn thành SỚM NHẤT trong danh sách = lò sắp ra kế tiếp (đếm ngược tới
+# mốc đó). Oven không có finish hợp lệ (fRaw = MinValue, hiển thị "--:--") bị bỏ qua.
+# Trả về hashtable oven, hoặc $null khi card rỗng/không còn oven nào hợp lệ.
+function CHON_LO_HIEN_TAI_CHO_MINIMAP($card) {
+    try {
+        if (-not $card -or -not $card.ovens -or $card.ovens.Count -eq 0) { return $null }
+        $chon = $null
+        foreach ($ov in $card.ovens) {
+            if ($ov.fRaw -eq [datetime]::MinValue) { continue }
+            if (-not $chon -or $ov.fRaw -lt $chon.fRaw) { $chon = $ov }
+        }
+        return $chon
+
+    } catch {
+        GHI_LOG "Lỗi hàm CHON_LO_HIEN_TAI_CHO_MINIMAP: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+        return $null
+    }
+}
+
+# ── Danh sách TỐI ĐA 2 loại lò (brand) từ SETTINGS.items -- dùng CHUNG cho
+# LAM_MOI_DU_LIEU_LO (Active.db) và LAY_DU_LIEU_LICH_SU_LO (yyyymmdd.db) để CẢ 2 nguồn
+# dữ liệu luôn cùng khóa theo cùng một danh sách loại lò (sort key -> giá trị item,
+# thiếu thì đệm chuỗi rỗng -- giữ nguyên ngữ nghĩa bản gốc).
+function LAY_DANH_SACH_LOAI_LO {
+    try {
+        $cardTypes = @()
+        foreach ($k in ($global:CFG.items.Keys | Sort-Object)) {
+            $cardTypes += $global:CFG.items[$k]
+            if ($cardTypes.Count -ge 2) { break }
+        }
+        while ($cardTypes.Count -lt 2) { $cardTypes += '' }
+        return $cardTypes
+
+    } catch {
+        GHI_LOG "Lỗi hàm LAY_DANH_SACH_LOAI_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+        return @('', '')
+    }
+}
+
+# ── Làm mới danh sách lò nướng từ Active.db theo loại trong SETTINGS.items ──
+#
+# Tham số $GiuDuLieuCuKhiLoi: khi $true VÀ đọc Active.db thất bại (file khoá quá lâu, XML
+# hỏng, chưa tồn tại...), hàm THOÁT NGAY và KHÔNG ĐỘNG tới $global:OVEN_DATA -- dữ liệu lò
+# nướng đang hiển thị được GIỮ NGUYÊN thay vì bị xoá về "0 OVEN". Dùng $true khi hàm này
+# đang chạy TRÊN CHÍNH UI thread (nút "Làm Mới Nhanh" qua CAP_NHAT_KHU_VUC_LO).
+#
+# GIÁ TRỊ TRẢ VỀ (bool): $true nếu Active.db đọc THÀNH CÔNG trong lần gọi này (bất kể
+# $GiuDuLieuCuKhiLoi là gì), $false nếu đọc THẤT BẠI ($xmlDoc = $null, dù đã thoát sớm hay
+# vẫn chạy tiếp dựng card rỗng) hoặc có exception. QUAN TRỌNG với đường gọi qua Runspace
+# nền (BAT_DAU_LAM_MOI_LO_NEN, main.ps1): người gọi PHẢI kiểm tra giá trị trả về này rồi
+# mới quyết định có áp $global:OVEN_DATA (của Runspace) vào UI hay không -- KHÔNG được suy
+# luận "có đổi file = đọc chắc chắn thành công", vì Active.db có thể vẫn đang bị khoá đúng
+# lúc đọc dù đã có sự kiện đổi file trước đó (đây chính là nguyên nhân bug "nhấp nháy 0
+# OVEN" khi lỗi trùng đúng lúc phát hiện đổi -- xem lịch sử fix).
+#
+# HÀM NÀY KHÔNG TỰ QUYẾT ĐỊNH có nên đọc lại Active.db hay không -- việc đó do NGƯỜI GỌI
+# tự kiểm tra cờ đổi/hẹn giờ debounce TRƯỚC KHI gọi hàm này. Khi ĐÃ gọi tới đây, hàm LUÔN
+# thử đọc thật; an toàn trước tình huống file đang ghi dở nhờ NAP_ACTIVE_DB tự retry khi
+# file bị khoá (xem DOI_FILE_KHONG_KHOA, Database.psm1).
+function LAM_MOI_DU_LIEU_LO {
+    param([bool]$GiuDuLieuCuKhiLoi = $false)
+    try {
+        # 2 card cố định từ SETTINGS.items (sort key → item1, item5) -- dùng hàm chung
+        # LAY_DANH_SACH_LOAI_LO để đồng bộ danh sách loại lò với nguồn lịch sử yyyymmdd.db
+        $cardTypes = LAY_DANH_SACH_LOAI_LO
+
+        $xmlDoc = NAP_ACTIVE_DB
+        if (-not $xmlDoc -and $GiuDuLieuCuKhiLoi) {
+            GHI_LOG "LAM_MOI_DU_LIEU_LO: đọc Active.db thất bại -- giữ nguyên dữ liệu lò cũ" 'WARN'
+            return $false
+        }
+
+        $global:OVEN_DATA = @()
+        $BADGE_COLOR      = '#64748B'   # Tất cả badge lò dùng chung 1 màu xám
+
+        foreach ($cardType in $cardTypes) {
+            $card = @{
+                brand       = $cardType
+                ovens       = [System.Collections.Generic.List[hashtable]]::new()
+                rank        = @()
+                det         = @{}
+                soLuongOven = 0     # Bộ đếm số oven đang có trong bảng của card này
+                tongSip     = 0.0   # Tổng SIP cộng dồn của tất cả oven trong card này
+            }
+
+            if ($xmlDoc -and $cardType -ne '') {
+                $nsm = [System.Xml.XmlNamespaceManager]::new($xmlDoc.NameTable)
+                $nsm.AddNamespace('o', 'urn:otms')
+
+                # Trong Active.db thực tế: KHÔNG có thẻ Batch — finish/status nằm
+                # trực tiếp trên Oven, và Items là con trực tiếp của Oven.
+                # (Khác với file lịch sử yyyymmdd.db, nơi Batch/cycle mới xuất hiện)
+                $ovenNodes   = $xmlDoc.SelectNodes("//o:Oven[@type='$cardType']", $nsm)
+                $rankCounts  = @{}   # Đếm số panel/mpanel theo model (dùng cho xếp hạng)
+                $tongSipCard = 0.0   # Cộng dồn tổng SIP của TẤT CẢ oven thuộc card này
+
+                foreach ($ovenNode in $ovenNodes) {
+                    $ovenId   = $ovenNode.GetAttribute('id')
+
+                    # Trạng thái: hiển thị NGUYÊN VĂN từ file, không sửa nội dung -- chỉ TÁCH
+                    # thành 2 phần để tô màu riêng phần trong ngoặc, ghép lại y hệt bản gốc.
+                    # Dữ liệu thực tế dạng "Baking(RISING)" / "Baking(BAKING)" / "Baking(COOLING)".
+                    $statusRaw      = $ovenNode.GetAttribute('status')
+                    $statusPrefix   = $statusRaw
+                    $statusParenTxt = ''
+                    $statusParenKey = ''
+                    $idxMoNgoac = $statusRaw.IndexOf('(')
+                    if ($idxMoNgoac -ge 0 -and $statusRaw.EndsWith(')')) {
+                        $statusPrefix   = $statusRaw.Substring(0, $idxMoNgoac)
+                        $statusParenTxt = $statusRaw.Substring($idxMoNgoac)
+                        $statusParenKey = $statusRaw.Substring($idxMoNgoac + 1, $statusRaw.Length - $idxMoNgoac - 2).Trim().ToUpper()
+                    }
+
+                    # Thời gian hoàn thành: chuyển từ "2026-02-19T16:53:00" → "16:53 19/2"
+                    # $finDt (DateTime thô) được LƯU LẠI trong 'fRaw' bên dưới để CAP_NHAT_GIAO_DIEN_LO
+                    # sắp xếp danh sách theo giờ hoàn thành gần nhất → xa nhất.
+                    $finishFmt = '--:--'
+                    $finDt     = [datetime]::MinValue
+                    if ([datetime]::TryParse($ovenNode.GetAttribute('finish'), [ref]$finDt)) {
+                        $finishFmt = $finDt.ToString('HH:mm') + ' ' + $finDt.Day + '/' + $finDt.Month
+                    }
+
+                    $card.ovens.Add(@{
+                        id             = $ovenId
+                        s              = $statusRaw
+                        statusPrefix   = $statusPrefix
+                        statusParenTxt = $statusParenTxt
+                        statusParenKey = $statusParenKey
+                        b              = $statusRaw
+                        f              = $finishFmt
+                        fRaw           = $finDt
+                        bc             = $BADGE_COLOR
+                    }) | Out-Null
+
+                    # Tạo dữ liệu chi tiết để hiển thị trong popup — Items là con trực tiếp của Oven
+                    $det = XAY_DUNG_CHI_TIET_LO $ovenNode $nsm
+                    $card.det[$ovenId] = $det
+                    $tongSipCard += $det.totalSipRaw
+                }
+
+                $card.soLuongOven = $card.ovens.Count
+                $card.tongSip     = $tongSipCard
+
+                # Đếm chính xác số Mpanel+Panel theo từng model trong toàn bộ Active.db
+                $allMp = $xmlDoc.SelectNodes("//o:Oven[@type='$cardType']/o:Items/o:Magaziner/o:Mpanel", $nsm)
+                $allP  = $xmlDoc.SelectNodes("//o:Oven[@type='$cardType']/o:Items/o:Panel", $nsm)
+                $rankCounts = @{}
+                foreach ($n in $allMp) {
+                    $m = $n.GetAttribute('model')
+                    if (-not $rankCounts.ContainsKey($m)) { $rankCounts[$m] = 0 }
+                    $rankCounts[$m]++
+                }
+                foreach ($n in $allP) {
+                    $m = $n.GetAttribute('model')
+                    if (-not $rankCounts.ContainsKey($m)) { $rankCounts[$m] = 0 }
+                    $rankCounts[$m]++
+                }
+
+                # Sắp xếp top 3 model theo số lượng giảm dần, định dạng MAG
+                $rankArr = $rankCounts.Keys |
+                           Sort-Object { $rankCounts[$_] } -Descending |
+                           Select-Object -First 3 |
+                           ForEach-Object { @{ m = $_; v = DINH_DANG_MAG $rankCounts[$_] } }
+                $card.rank = @($rankArr)
+            }
+
+            $card.ovens        = @($card.ovens)
+            $global:OVEN_DATA += $card
+        }
+
+        return ($null -ne $xmlDoc)
+
+    } catch {
+        GHI_LOG "Lỗi hàm LAM_MOI_DU_LIEU_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+        return $false
+    }
+}
+
+function CAP_NHAT_KHU_VUC_LO {
+    try {
+        try {
+            # Chỉ đọc lại Active.db khi FileSystemWatcher đã báo có thay đổi (cờ dùng
+            # chung $global:TRANG_THAI_DUNG_CHUNG['ActiveDbDaThayDoi'], đặt ở main.ps1) --
+            # ĐÚNG cùng logic "5.1" áp dụng cho chu kỳ tự động (BAT_DAU_LAM_MOI_NEN). Nếu
+            # KHÔNG có thay đổi, GIỮ NGUYÊN dữ liệu lò nướng cũ, không đọc lại Active.db.
+            $daThayDoi = $false
+            if ($global:TRANG_THAI_DUNG_CHUNG -and $global:TRANG_THAI_DUNG_CHUNG['ActiveDbDaThayDoi']) {
+                $daThayDoi = $true
+                $global:TRANG_THAI_DUNG_CHUNG['ActiveDbDaThayDoi'] = $false
+            }
+
+            if ($daThayDoi) {
+                $doTreMs = 300
+                if ($global:CFG -and $global:CFG.config.ContainsKey('retry_delay')) {
+                    $rdTmp = 0
+                    if ([int]::TryParse([string]$global:CFG.config['retry_delay'], [ref]$rdTmp) -and $rdTmp -ge 0) { $doTreMs = $rdTmp }
+                }
+                Start-Sleep -Milliseconds $doTreMs
+                LAM_MOI_DU_LIEU_LO -GiuDuLieuCuKhiLoi $true
+                CAP_NHAT_GIAO_DIEN_LO
+            }
+        } catch {
+            GHI_LOG "Lỗi CAP_NHAT_KHU_VUC_LO: $($_.Exception.Message) | $($_.InvocationInfo.PositionMessage)" 'ERROR'
+        }
+
+    } catch {
+        GHI_LOG "Lỗi hàm CAP_NHAT_KHU_VUC_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
+}
+
+# ── Chỉ gán ItemsSource từ $global:OVEN_DATA đã có sẵn — KHÔNG đọc lại
+# Active.db. Tách riêng để dùng sau khi tính toán xong trên Runspace nền,
+# lúc đó chỉ cần bind vào UI (phần bắt buộc phải chạy trên UI thread).
+function CAP_NHAT_GIAO_DIEN_LO {
+    try {
+        $global:AS.ovenDets = @{}
+
+        $MAUHUYCHNG = @('#F59E0B','#94A3B8','#CD7F32')   # Vàng, Bạc, Đồng
+
+        for ($i = 0; $i -lt 2; $i++) {
+            $cat      = if ($i -lt $global:OVEN_DATA.Count) { $global:OVEN_DATA[$i] } else { $null }
+            $tieuDeEl = if ($i -eq 0) { $global:e.Label_Ten_Lo_1 } else { $global:e.Label_Ten_Lo_2 }
+            $danhSach = if ($i -eq 0) { $global:e.Danh_Sach_Lo_1  } else { $global:e.Danh_Sach_Lo_2  }
+            $xepHang  = if ($i -eq 0) { $global:e.Danh_Sach_Xep_Hang_1  } else { $global:e.Danh_Sach_Xep_Hang_2  }
+            $slEl     = if ($i -eq 0) { $global:e.Label_So_Luong_Lo_1  } else { $global:e.Label_So_Luong_Lo_2  }
+            $sipEl    = if ($i -eq 0) { $global:e.Label_Tong_Sip_Lo_1  } else { $global:e.Label_Tong_Sip_Lo_2  }
+
+            # Gán tiêu đề card từ SETTINGS.items
+            $tieuDeEl.Text = if ($cat) { $cat.brand } else { '---' }
+
+            # Bộ đếm số oven đang có trong bảng + tổng SIP cộng dồn của card này
+            if ($slEl)  { $slEl.Text  = "$(if($cat){$cat.soLuongOven}else{0}) OVEN" }
+            if ($sipEl) { $sipEl.Text = "$(DINH_DANG_SO $(if($cat){$cat.tongSip}else{0})) SIP" }
+
+            # Tạo danh sách hiển thị từng dòng lò nướng -- SẮP XẾP theo Finish gần nhất → xa
+            # nhất (trên xuống dưới). Oven chưa có finish hợp lệ (fRaw = MinValue, hiển thị
+            # "--:--") bị đẩy xuống CUỐI danh sách bằng cách coi như MaxValue khi sort, để
+            # không bị hiểu nhầm là "sắp xong nhất" (MinValue vốn luôn nhỏ nhất nếu sort thẳng).
+            $dsLo = [System.Collections.Generic.List[PSObject]]::new()
+            if ($cat -and $cat.ovens.Count -gt 0) {
+                $ovensSapXep = $cat.ovens | Sort-Object {
+                    if ($_.fRaw -ne [datetime]::MinValue) { $_.fRaw } else { [datetime]::MaxValue }
+                }
+                foreach ($ov in $ovensSapXep) {
+                    $dsLo.Add([PSCustomObject]@{
+                        OvenId         = $ov.id
+                        Status         = $ov.s
+                        StatusPrefix   = $ov.statusPrefix
+                        StatusParenTxt = $ov.statusParenTxt
+                        StatusParenKey = $ov.statusParenKey
+                        Finish         = $ov.f
+                    })
+                }
+            }
+            $danhSach.ItemsSource = $dsLo
+
+            # Tạo danh sách xếp hạng top 3 model
+            $dsXepHang = [System.Collections.Generic.List[PSObject]]::new()
+            if ($cat -and $cat.rank.Count -gt 0) {
+                $ri = 0
+                foreach ($rk in $cat.rank) {
+                    $dsXepHang.Add([PSCustomObject]@{
+                        Rank       = ($ri + 1).ToString()
+                        ModelId    = $rk.m
+                        MagValue   = $rk.v
+                        MedalColor = if ($ri -lt $MAUHUYCHNG.Count) { $MAUHUYCHNG[$ri] } else { '#CBD5E1' }
+                    })
+                    $ri++
+                }
+            }
+            $xepHang.ItemsSource = $dsXepHang
+
+            # Lưu dữ liệu chi tiết các lò để popup sử dụng
+            if ($cat) {
+                foreach ($dk in $cat.det.Keys) { $global:AS.ovenDets[$dk] = $cat.det[$dk] }
+            }
+        }
+
+    } catch {
+        GHI_LOG "Lỗi hàm CAP_NHAT_GIAO_DIEN_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
+}
+
+
+# ================================================================
+# VÙNG 12 — CỬA SỔ CHI TIẾT LÒ NƯỚNG (Cửa sổ nổi hiện khi click vào lò)
+# ================================================================
+function HIEN_POPUP_LO([string]$ovenId){
+    try {
+        $data = if($global:AS.ovenDets.ContainsKey($ovenId)){$global:AS.ovenDets[$ovenId]}else{$null}
+
+        $global:e.Label_Popup_Ma_Lo.Text  = "Oven: $ovenId"
+        $global:e.Label_Popup_Mag.Text = if($data){ $data.totalMag }else{ '0,0 MAG' }
+        $global:e.Label_Popup_Sip.Text = if($data){ $data.totalSip }else{ '0 SIP' }
+        $global:e.Khung_Popup_Noi_Dung.Children.Clear()
+
+        if(-not $data -or $data.models.Count -eq 0){
+            $empty = New-Object Windows.Controls.TextBlock
+            $empty.Text = 'Không có dữ liệu trong lò này'
+            $empty.FontSize = 11; $empty.Foreground = TAO_MAU '#CBD5E1'
+            $empty.Margin = [Windows.Thickness]::new(12,10,12,10)
+            $global:e.Khung_Popup_Noi_Dung.Children.Add($empty)|Out-Null
+            MO_LOP_PHU $global:e.Popup_Chi_Tiet_Lo $null; return
+        }
+
+        foreach($mEntry in $data.models){
+            # ── Model header row: bullet "•" + tên model + box MAG nổi bật ──
+            $mBorder = New-Object Windows.Controls.Border
+            $mBorder.Background     = TAO_MAU '#F8FAFC'
+            $mBorder.BorderBrush    = TAO_MAU '#E2E8F0'
+            $mBorder.BorderThickness= [Windows.Thickness]::new(0,0,0,1)
+            $mBorder.Padding        = [Windows.Thickness]::new(12,7,12,7)
+
+            $mGrid = New-Object Windows.Controls.Grid
+            $mc1 = New-Object Windows.Controls.ColumnDefinition
+            $mc1.Width = [Windows.GridLength]::new(1,[Windows.GridUnitType]::Star)
+            $mc2 = New-Object Windows.Controls.ColumnDefinition
+            $mc2.Width = [Windows.GridLength]::new(80)
+            $mGrid.ColumnDefinitions.Add($mc1); $mGrid.ColumnDefinitions.Add($mc2)
+
+            $mIdTB = New-Object Windows.Controls.TextBlock
+            $mIdTB.Text = "•  $($mEntry.id)"
+            $mIdTB.FontSize = 12; $mIdTB.FontWeight = 'Bold'
+            $mIdTB.Foreground = TAO_MAU '#1E293B'
+            $mIdTB.VerticalAlignment = 'Center'
+            $mIdTB.TextTrimming = 'CharacterEllipsis'
+            [Windows.Controls.Grid]::SetColumn($mIdTB, 0)
+            $mGrid.Children.Add($mIdTB)|Out-Null
+
+            $mMagBox = New-Object Windows.Controls.Border
+            $mMagBox.Background  = TAO_MAU '#EFF6FF'
+            $mMagBox.CornerRadius= [Windows.CornerRadius]::new(5)
+            $mMagBox.Padding     = [Windows.Thickness]::new(6,2,6,2)
+            $mMagBox.HorizontalAlignment = 'Right'
+            $mMagTB = New-Object Windows.Controls.TextBlock
+            $mMagTB.Text = $mEntry.mag
+            $mMagTB.FontSize = 11; $mMagTB.FontWeight = 'Bold'
+            $mMagTB.Foreground = TAO_MAU '#005696'
+            $mMagBox.Child = $mMagTB
+            [Windows.Controls.Grid]::SetColumn($mMagBox, 1)
+            $mGrid.Children.Add($mMagBox)|Out-Null
+
+            $mBorder.Child = $mGrid
+            $global:e.Khung_Popup_Noi_Dung.Children.Add($mBorder)|Out-Null
+
+            # ── Config rows (indented) ────────────────────────────────
+            foreach($cfg in $mEntry.configs){
+                $cBorder = New-Object Windows.Controls.Border
+                $cBorder.BorderBrush     = TAO_MAU '#F1F5F9'
+                $cBorder.BorderThickness = [Windows.Thickness]::new(0,0,0,1)
+                $cBorder.Padding         = [Windows.Thickness]::new(24,5,12,5)
+                $cBorder.Background      = [Windows.Media.Brushes]::White
+
+                $cGrid = New-Object Windows.Controls.Grid
+                $cc1 = New-Object Windows.Controls.ColumnDefinition
+                $cc1.Width = [Windows.GridLength]::new(1,[Windows.GridUnitType]::Star)
+                $cc2 = New-Object Windows.Controls.ColumnDefinition
+                $cc2.Width = [Windows.GridLength]::new(72)
+                $cc3 = New-Object Windows.Controls.ColumnDefinition
+                $cc3.Width = [Windows.GridLength]::new(80)
+                $cGrid.ColumnDefinitions.Add($cc1)
+                $cGrid.ColumnDefinitions.Add($cc2)
+                $cGrid.ColumnDefinitions.Add($cc3)
+
+                # Config code
+                $cCodeTB = New-Object Windows.Controls.TextBlock
+                $cCodeTB.Text      = $cfg.code
+                $cCodeTB.FontSize  = 10
+                $cCodeTB.FontFamily= New-Object Windows.Media.FontFamily 'Courier New'
+                $cCodeTB.Foreground= TAO_MAU '#475569'
+                $cCodeTB.VerticalAlignment = 'Center'
+                $cCodeTB.TextTrimming = 'CharacterEllipsis'
+                [Windows.Controls.Grid]::SetColumn($cCodeTB, 0)
+                $cGrid.Children.Add($cCodeTB)|Out-Null
+
+                # MAG count
+                $cMagTB = New-Object Windows.Controls.TextBlock
+                $cMagTB.Text       = $cfg.mag
+                $cMagTB.FontSize   = 10; $cMagTB.FontWeight = 'Normal'
+                $cMagTB.Foreground = TAO_MAU '#64748B'
+                $cMagTB.HorizontalAlignment = 'Right'
+                $cMagTB.VerticalAlignment   = 'Center'
+                [Windows.Controls.Grid]::SetColumn($cMagTB, 1)
+                $cGrid.Children.Add($cMagTB)|Out-Null
+
+                # SIP
+                $cSipTB = New-Object Windows.Controls.TextBlock
+                $cSipTB.Text       = $cfg.sip
+                $cSipTB.FontSize   = 10; $cSipTB.FontWeight = 'Bold'
+                $cSipTB.Foreground = TAO_MAU '#0071E3'
+                $cSipTB.HorizontalAlignment = 'Right'
+                $cSipTB.VerticalAlignment   = 'Center'
+                [Windows.Controls.Grid]::SetColumn($cSipTB, 2)
+                $cGrid.Children.Add($cSipTB)|Out-Null
+
+                $cBorder.Child = $cGrid
+                $global:e.Khung_Popup_Noi_Dung.Children.Add($cBorder)|Out-Null
+            }
+
+            # ── Dòng tổng SIP của model này -- box nổi bật, canh phải ──
+            $sBorder = New-Object Windows.Controls.Border
+            $sBorder.BorderBrush     = TAO_MAU '#F1F5F9'
+            $sBorder.BorderThickness = [Windows.Thickness]::new(0,0,0,1)
+            $sBorder.Padding         = [Windows.Thickness]::new(24,5,12,7)
+            $sBorder.Background      = [Windows.Media.Brushes]::White
+            $sPanel = New-Object Windows.Controls.StackPanel
+            $sPanel.HorizontalAlignment = 'Right'
+            $sBox = New-Object Windows.Controls.Border
+            $sBox.Background   = TAO_MAU '#EFF6FF'
+            $sBox.CornerRadius = [Windows.CornerRadius]::new(5)
+            $sBox.Padding      = [Windows.Thickness]::new(8,3,8,3)
+            $sTB = New-Object Windows.Controls.TextBlock
+            $sTB.Text = $mEntry.sip
+            $sTB.FontSize = 11; $sTB.FontWeight = 'Black'
+            $sTB.Foreground = TAO_MAU '#005696'
+            $sBox.Child = $sTB
+            $sPanel.Children.Add($sBox)|Out-Null
+            $sBorder.Child = $sPanel
+            $global:e.Khung_Popup_Noi_Dung.Children.Add($sBorder)|Out-Null
+        }
+        MO_LOP_PHU $global:e.Popup_Chi_Tiet_Lo $null
+
+    } catch {
+        GHI_LOG "Lỗi hàm HIEN_POPUP_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
+}
+function AN_POPUP_LO{
+    try {     DONG_LOP_PHU $global:e.Popup_Chi_Tiet_Lo 
+    } catch {
+        GHI_LOG "Lỗi hàm AN_POPUP_LO: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
+}
+
+# ================================================================
+# XUẤT HÀM RA NGOÀI MODULE
+# ================================================================
+Export-ModuleMember -Function DINH_DANG_MAG, XAY_DUNG_CHI_TIET_LO, XAY_DUNG_CHI_TIET_LO_LICH_SU, LAY_THOI_GIAN_HOAN_THANH_LO, LAY_DU_LIEU_LICH_SU_LO, CHON_LO_HIEN_TAI_CHO_MINIMAP, LAY_DANH_SACH_LOAI_LO, LAM_MOI_DU_LIEU_LO, CAP_NHAT_KHU_VUC_LO, CAP_NHAT_GIAO_DIEN_LO, HIEN_POPUP_LO, AN_POPUP_LO
