@@ -1,4 +1,4 @@
-﻿# ================================================================
+# ================================================================
 # main.ps1 -- Điều phối toàn bộ module cho OTMSAnalyzer V10
 # Ứng dụng màn hình toàn phần (WPF / PowerShell 5.1)
 # Mã hoá dữ liệu: AES-256-CBC + Nén GZip
@@ -168,9 +168,18 @@ function DONG_VE([string]$manHinhKe){
 # ── Gán 3 chấm macOS cho cửa sổ hiện tại (cùng vị trí, khác hành vi từng màn hình) ──
 # (đặt tên param $doHanh -- tránh trùng từ khóa 'do' của PowerShell)
 function GAN_CHAM_MAC([scriptblock]$xanh, [scriptblock]$vang, [scriptblock]$doHanh){
-    $global:e.Cham_Xanh.Add_MouseLeftButtonDown($xanh)
-    $global:e.Cham_Vang.Add_MouseLeftButtonDown($vang)
-    $global:e.Cham_Do.Add_MouseLeftButtonDown($doHanh)
+    try {
+        if ($global:e.Cham_Xanh) { $global:e.Cham_Xanh.Add_MouseLeftButtonDown($xanh) }
+        else { GHI_LOG "GAN_CHAM_MAC: Cham_Xanh null -- handler xanh không gán được" 'ERROR' }
+
+        if ($global:e.Cham_Vang) { $global:e.Cham_Vang.Add_MouseLeftButtonDown($vang) }
+        else { GHI_LOG "GAN_CHAM_MAC: Cham_Vang null -- handler vàng không gán được" 'ERROR' }
+
+        if ($global:e.Cham_Do) { $global:e.Cham_Do.Add_MouseLeftButtonDown($doHanh) }
+        else { GHI_LOG "GAN_CHAM_MAC: Cham_Do null -- handler đỏ không gán được" 'ERROR' }
+    } catch {
+        GHI_LOG "Lỗi GAN_CHAM_MAC: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
 }
 
 # ════════════════════════════════════════════════════════════════
