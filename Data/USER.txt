@@ -1,0 +1,16 @@
+﻿{
+  "users": {
+    "VN004043": {
+      "name": "Administrator"
+    },
+    "VN004128": {
+      "name": "Trần Minh Quân"
+    },
+    "VN003872": {
+      "name": "Lê Hoàng Nam"
+    },
+    "VN005214": {
+      "name": "Phạm Quốc Huy"
+    }
+  }
+}

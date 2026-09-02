@@ -1,0 +1,37 @@
+﻿{
+  "2103-024300-60": {
+    "type_name": "C10.5",
+    "plan": 30000,
+    "actual_sip": 160,
+    "actual": 5000,
+    "active": true
+  },
+  "2103-024400-60": {
+    "type_name": "C10.5",
+    "plan": 34000,
+    "actual_sip": 160,
+    "actual": 7200,
+    "active": true
+  },
+  "2103-024310-60": {
+    "type_name": "C10.5",
+    "plan": 35000,
+    "actual_sip": 160,
+    "actual": 6100,
+    "active": true
+  },
+  "2103-024000-80": {
+    "type_name": "Hades",
+    "plan": 9000,
+    "actual_sip": 82,
+    "actual": 1800,
+    "active": true
+  },
+  "2103-024410-60": {
+    "type_name": "C10.5",
+    "plan": 1900,
+    "actual_sip": 160,
+    "actual": 950,
+    "active": true
+  }
+}

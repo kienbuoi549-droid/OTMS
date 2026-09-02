@@ -1,0 +1,30 @@
+﻿{
+  "items": {
+    "item1": "C10.5",
+    "item7": "Hades"
+  },
+
+  "config": {
+    "max_retry": 2,
+    "retry_delay": 300,
+    "gap_time_min": 5,
+    "length_panel": 14,
+    "folder_main": "D:\OTMS",
+    "folder_data": "C:\User\VN000166\OTMS\Data",
+    "folder_database": "C:\User\VN000166\OTMS\Data\Database",
+    "refresh": 60000,
+    "enable_log": "true"
+  },
+
+  "url_params": {
+    "employee_id": "VN004043"
+  },
+
+  "urls": {
+    "main": "http://10.5.1.123:8081/OTMS_Entry.aspx?EmployeeID={EMPLOYEE_ID}",
+    "detail": "http://10.5.1.123:8081/OTMS_RemoteJQ.aspx",
+    "mag": "http://10.5.1.9/SFIS/Production/Travelers/Trav_1/resources/getQueryJSON.jsp?ColItem=CARRIER_ID&Field_Kind=SELECT&fdSerial_Number=Y&fdBCadd=Y&InpData={0}&FromURL=N",
+    "panel": "http://10.5.1.9/SFIS/Production/Query_SN_Status/ajax/GetQueryData.jsp?SN={0}",
+    "qahour": "http://10.5.1.9/SFIS/Yield/QA/resources/getQueryJSON.jsp"
+  }
+}
