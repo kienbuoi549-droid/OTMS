@@ -161,8 +161,17 @@ function NAP_CUA_SO([string]$tenFileXaml){
 
 # ── Đóng cửa sổ hiện tại và đi tới màn hình kế tiếp ('UI' | 'RANKING' | 'MINIMAP' | 'EXIT') ──
 function DONG_VE([string]$manHinhKe){
-    $global:MAN_HINH_KE = $manHinhKe
-    $global:W.Close()
+    try {
+        GHI_LOG "DONG_VE: chuyển sang '$manHinhKe'" 'INFO'
+        $global:MAN_HINH_KE = $manHinhKe
+        if ($global:W) {
+            $global:W.Close()
+        } else {
+            GHI_LOG "DONG_VE: \$global:W là null -- bỏ qua Close()" 'ERROR'
+        }
+    } catch {
+        GHI_LOG "Lỗi DONG_VE('$manHinhKe'): $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
+    }
 }
 
 # ── Gán 3 chấm macOS cho cửa sổ hiện tại (cùng vị trí, khác hành vi từng màn hình) ──
@@ -1230,12 +1239,18 @@ function BAT_DAU_LAM_MOI_LO_NEN {
 # ================================================================
 function MO_MAN_HINH_UI {
     NAP_CUA_SO 'UI.xaml'
-    # BlurEffect là đối tượng đặc biệt — phải lấy qua thuộc tính Effect của mainContent
-    $global:e.Hieu_Ung_Mo = (TIM_PHAN_TU 'mainContent').Effect
     $global:UI_HOAT_DONG = $true
     _GHI_MOC_THOI_GIAN "Nạp UI.xaml + FindName tất cả phần tử xong"
 
-$global:W.Add_MouseLeftButtonDown({
+    # BlurEffect — lấy an toàn, bỏ qua nếu không tìm thấy mainContent
+    try {
+        $mc = TIM_PHAN_TU 'mainContent'
+        if ($mc) { $global:e.Hieu_Ung_Mo = $mc.Effect }
+    } catch {
+        GHI_LOG "MO_MAN_HINH_UI: lấy Hieu_Ung_Mo lỗi (không blocking): $($_.Exception.Message)" 'WARN'
+    }
+
+ $global:W.Add_MouseLeftButtonDown({
     param($s,$ev)
     # Chỉ kéo cửa sổ khi không phóng to và click đúng vào Window
     if($global:W.WindowState -ne 'Maximized' -and $ev.Source -is [System.Windows.Window]){
@@ -1245,10 +1260,13 @@ $global:W.Add_MouseLeftButtonDown({
 
 # Nút điều khiển cửa sổ kiểu macOS (đỏ/vàng/xanh)
 # LUỒNG MỚI: XANH = mở OvenRanking (ghi đè toggle phóng to theo yêu cầu) | VÀNG = thu nhỏ | ĐỎ = thoát
-GAN_CHAM_MAC { DONG_VE 'RANKING' } {
-    if($global:W.WindowState-eq 'Minimized'){$global:W.WindowState='Maximized'}else{$global:W.WindowState='Minimized'}
-} { DONG_VE 'EXIT' }
-
+try {
+    GAN_CHAM_MAC { DONG_VE 'RANKING' } {
+        if($global:W.WindowState-eq 'Minimized'){$global:W.WindowState='Maximized'}else{$global:W.WindowState='Minimized'}
+    } { DONG_VE 'EXIT' }
+} catch {
+    GHI_LOG "MO_MAN_HINH_UI: Lỗi gán 3 chấm macOS -- không thể chuyển giao diện: $($_.Exception.Message)" 'ERROR'
+}
 # Nút "Làm Mới Nhanh" (title bar) -- ép làm mới NGAY, không đợi lịch 60 giây.
 # CHỈ áp dụng cho San lượng + QA-HOUR -- Oven KHÔNG còn do nút này điều khiển nữa (đã
 # tách thành cơ chế tự động riêng: FileSystemWatcher + hẹn giờ debounce 5 giây +
