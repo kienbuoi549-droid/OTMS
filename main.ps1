@@ -134,6 +134,14 @@ $global:LO_LICH_SU = @{}
 # danh sách element cho từng giao diện mới (giống cách $global:e cũ nhưng tự động hoá).
 # Nạp LỖI -> $global:W = $null: vòng lặp điều hướng sẽ thoát sạch sẽ qua khối dọn dẹp
 # thay vì để exception giết tiến trình (rò rỉ Mutex/Runspace).
+#
+# LƯU Ý KHI BẢO TRÌ: hàm này LUÔN tạo Window MỚI mỗi lần gọi (XamlReader.Load) -- nhờ vậy
+# các event handler gắn vào $global:W (Add_Loaded / Add_MouseLeftButtonDown / Add_KeyDown
+# / Add_PreviewMouseDown...) và handler gắn vào từng $global:e.XXX (Add_Click / Add_Mouse...)
+# đều được "reset sạch" theo cửa sổ mới, KHÔNG BAO GIỜ chồng handler qua các lần điều
+# hướng. NẾU SAU NÀY có ai refactor để TÁI SỬ DỤNG cùng 1 Window (không tạo mới), BẮT BUỘC
+# phải RemoveHandler / gỡ sự kiện cũ TRƯỚC KHI gắn lại, nếu không mỗi lần vào lại màn sẽ
+# chạy handler 2 lần, 3 lần... (đè popup, ghi đè dữ liệu, gọi API trùng...).
 function NAP_CUA_SO([string]$tenFileXaml){
     try {
         $xamlPath = Join-Path $APP_ROOT $tenFileXaml
@@ -160,35 +168,25 @@ function NAP_CUA_SO([string]$tenFileXaml){
 }
 
 # ── Đóng cửa sổ hiện tại và đi tới màn hình kế tiếp ('UI' | 'RANKING' | 'MINIMAP' | 'EXIT') ──
+# FIX v2.6.1: TẮT CỜ UI_HOAT_DONG NGAY TẠI ĐÂY thay vì chờ tới khi hàm MO_MAN_HINH_*
+# của màn kế tiếp chạy xong dòng $global:UI_HOAT_DONG = $false tương ứng. Lý do: giữa
+# thời điểm ShowDialog() trả về (cửa sổ cũ vừa đóng) và thời điểm MO_MAN_HINH_* chạy,
+# BG_POLL_TIMER (150ms) có thể tick trúng và cố gán ItemsSource / Text vào element
+# của cửa sổ ĐÃ CHẾT -- vì $global:e lúc đó vẫn còn là hashtable của màn cũ. Trên lý
+# thuyết hiếm gặp, nhưng đặt cờ $false ngay trong DONG_VE là biện pháp phòng vệ rẻ
+# tiền, đóng kín khe hở thời gian này mà không đổi hành vi bình thường.
 function DONG_VE([string]$manHinhKe){
-    try {
-        GHI_LOG "DONG_VE: chuyển sang '$manHinhKe'" 'INFO'
-        $global:MAN_HINH_KE = $manHinhKe
-        if ($global:W) {
-            $global:W.Close()
-        } else {
-            GHI_LOG "DONG_VE: \$global:W là null -- bỏ qua Close()" 'ERROR'
-        }
-    } catch {
-        GHI_LOG "Lỗi DONG_VE('$manHinhKe'): $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
-    }
+    $global:UI_HOAT_DONG = $false
+    $global:MAN_HINH_KE = $manHinhKe
+    $global:W.Close()
 }
 
 # ── Gán 3 chấm macOS cho cửa sổ hiện tại (cùng vị trí, khác hành vi từng màn hình) ──
 # (đặt tên param $doHanh -- tránh trùng từ khóa 'do' của PowerShell)
 function GAN_CHAM_MAC([scriptblock]$xanh, [scriptblock]$vang, [scriptblock]$doHanh){
-    try {
-        if ($global:e.Cham_Xanh) { $global:e.Cham_Xanh.Add_MouseLeftButtonDown($xanh) }
-        else { GHI_LOG "GAN_CHAM_MAC: Cham_Xanh null -- handler xanh không gán được" 'ERROR' }
-
-        if ($global:e.Cham_Vang) { $global:e.Cham_Vang.Add_MouseLeftButtonDown($vang) }
-        else { GHI_LOG "GAN_CHAM_MAC: Cham_Vang null -- handler vàng không gán được" 'ERROR' }
-
-        if ($global:e.Cham_Do) { $global:e.Cham_Do.Add_MouseLeftButtonDown($doHanh) }
-        else { GHI_LOG "GAN_CHAM_MAC: Cham_Do null -- handler đỏ không gán được" 'ERROR' }
-    } catch {
-        GHI_LOG "Lỗi GAN_CHAM_MAC: $($_.Exception.Message) | Dòng: $($_.InvocationInfo.ScriptLineNumber)" 'ERROR'
-    }
+    $global:e.Cham_Xanh.Add_MouseLeftButtonDown($xanh)
+    $global:e.Cham_Vang.Add_MouseLeftButtonDown($vang)
+    $global:e.Cham_Do.Add_MouseLeftButtonDown($doHanh)
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -511,8 +509,19 @@ function TAO_POPUP_LO_RANKING([string]$ovenId, $det) {
 # ── Vẽ TOÀN BỘ nội dung 2 card từ $global:OVEN_DATA (bảng lò + top ranking + popup) ──
 # Gọi từ: MO_MAN_HINH_RANKING (vào màn hình) và BG_POLL_TIMER_LO tick (dữ liệu mới về
 # khi đang ở Ranking -- Active.db vừa được ghi). Popup đang mở được GIỮ lại theo ovenId.
+#
+# FIX v2.6.1: thêm guard $global:MAN_HINH_HIEN_TAI -ne 'RANKING' -> return ngay. Lý do:
+# giữa thời điểm bấm chấm chuyển màn (UI_HOAT_DONG đã tắt, MAN_HINH_KE đã đổi, cửa sổ
+# Ranking đang close) và thời điểm vòng lặp while ở cuối main.ps1 kịp cập nhật
+# MAN_HINH_HIEN_TAI, timer nền có thể tick và gọi hàm này cho màn KHÔNG còn là Ranking
+# -> gán dữ liệu vào element của cửa sổ đã chết. Guard cũ `-not $global:e['Card1_Ten']`
+# chỉ chặn được trường hợp XAML mới hoàn toàn KHÔNG có element trùng tên; nếu màn mới
+# (vd MiniMap) tình cờ có element tên trùng (hiện tại thì chưa, nhưng dễ xảy ra khi mở
+# rộng XAML sau này) thì guard cũ sẽ lọt. Guard mới dựa trên TÊN MÀN HÌNH đang sống
+# -- chính xác tuyệt đối, không phụ thuộc việc XAML có element trùng tên hay không.
 function CAP_NHAT_GIAO_DIEN_RANKING {
     try {
+        if ($global:MAN_HINH_HIEN_TAI -ne 'RANKING') { return }   # chốt chặt theo màn hình đang sống
         if (-not $global:e -or -not $global:e['Card1_Ten']) { return }   # cửa sổ Ranking chưa sống
 
         # Ghi nhớ popup đang mở theo ovenId để khôi phục sau khi vẽ lại bằng dữ liệu tươi
@@ -613,6 +622,17 @@ function MO_MAN_HINH_RANKING {
     NAP_CUA_SO 'OvenRanking.xaml'
     $global:UI_HOAT_DONG = $false
     _GHI_MOC_THOI_GIAN "Nạp OvenRanking.xaml xong"
+
+    # FIX v2.6.1: RESET TRẠNG THÁI POPUP ĐANG MỞ MỖI LẦN VÀO MÀN RANKING. Trước đây
+    # RANKING_POP_MO/RANKING_ROW_MO/RANKING_ROW_MO_ID được giữ NGUYÊN qua các lần điều
+    # hướng, nên khi user: mở popup lò A ở Ranking -> Cham_Vang về UI -> Cham_Xanh vào
+    # lại Ranking -> CAP_NHAT_GIAO_DIEN_RANKING thấy ID cũ vẫn còn trong dữ liệu mới và
+    # TỰ ĐỘNG MỞ LẠI popup lò A, gây cảm giác "bất ngờ" (user không bấm gì mà popup tự
+    # hiện). Việc GIỮ popup qua các lần VẼ LẠI dữ liệu (BG_POLL_TIMER_LO tick khi ĐANG ở
+    # Ranking) vẫn giữ nguyên -- chỉ reset khi VÀO MỚI màn hình từ màn khác.
+    $global:RANKING_POP_MO    = $null
+    $global:RANKING_ROW_MO    = $null
+    $global:RANKING_ROW_MO_ID = $null
 
     # Kéo cửa sổ (khi không phóng to) -- giữ cùng nguyên tắc với UI.xaml
     $global:W.Add_MouseLeftButtonDown({
@@ -915,6 +935,12 @@ function MO_MAN_HINH_MINIMAP {
         $global:MINIMAP_TIMER.Interval = [TimeSpan]::FromSeconds(1)
         $global:MINIMAP_TIMER.Add_Tick({
             try {
+                # FIX v2.6.1: chỉ chạy khi ĐANG Ở MiniMap -- nếu đã chuyển sang màn khác mà
+                # timer này chưa kịp Stop() (vòng lặp while ở cuối main.ps1 dừng nó sau khi
+                # ShowDialog trả về, nhưng có 1 khoảng ngắn DispatcherTimer vẫn tick được),
+                # việc giảm Rem và gọi CAP_NHAT_DEM_NGUOC_MINIMAP trên element $global:e
+                # của màn mới sẽ gây lỗi. Guard theo MAN_HINH_HIEN_TAI là rẻ nhất và đúng nhất.
+                if ($global:MAN_HINH_HIEN_TAI -ne 'MINIMAP') { return }
                 foreach ($k in @($global:MM_LINES)) {
                     if ($k -and $global:MM_DATA.ContainsKey($k) -and -not $global:MM_DATA[$k].KhongCoLo) {
                         if ($global:MM_DATA[$k].Rem -gt 0) { $global:MM_DATA[$k].Rem -= 1 }
@@ -1202,8 +1228,16 @@ function BAT_DAU_LAM_MOI_LO_NEN {
                         #   MINIMAP : dựng lại $global:MM_DATA từ dữ liệu mới rồi vẽ line
                         # Dữ liệu $global:OVEN_DATA/$global:LO_LICH_SU luôn cập nhật đầy đủ dù
                         # đang ở màn hình nào.
+                        #
+                        # FIX v2.6.1:
+                        #   - Nhánh 'UI' thêm guard $global:UI_HOAT_DONG -- tránh gọi
+                        #     CAP_NHAT_GIAO_DIEN_LO (hàm KHÔNG có guard nội bộ) khi cửa sổ
+                        #     UI đã đóng nhưng MAN_HINH_HIEN_TAI chưa kịp đổi (khe hở thời
+                        #     gian rất ngắn nhưng có thật, xem thêm fix ở DONG_VE).
+                        #   - Nhánh 'RANKING' và 'MINIMAP' đã tự có guard nội bộ (MAN_HINH_
+                        #     HIEN_TAI và $global:e[key] tương ứng) nên không cần bọc thêm.
                         switch ($global:MAN_HINH_HIEN_TAI) {
-                            'UI'      { CAP_NHAT_GIAO_DIEN_LO }
+                            'UI'      { if ($global:UI_HOAT_DONG) { CAP_NHAT_GIAO_DIEN_LO } }
                             'RANKING' { CAP_NHAT_GIAO_DIEN_RANKING }
                             'MINIMAP' {
                                 CAP_NHAT_DU_LIEU_MINIMAP
@@ -1239,18 +1273,12 @@ function BAT_DAU_LAM_MOI_LO_NEN {
 # ================================================================
 function MO_MAN_HINH_UI {
     NAP_CUA_SO 'UI.xaml'
+    # BlurEffect là đối tượng đặc biệt — phải lấy qua thuộc tính Effect của mainContent
+    $global:e.Hieu_Ung_Mo = (TIM_PHAN_TU 'mainContent').Effect
     $global:UI_HOAT_DONG = $true
     _GHI_MOC_THOI_GIAN "Nạp UI.xaml + FindName tất cả phần tử xong"
 
-    # BlurEffect — lấy an toàn, bỏ qua nếu không tìm thấy mainContent
-    try {
-        $mc = TIM_PHAN_TU 'mainContent'
-        if ($mc) { $global:e.Hieu_Ung_Mo = $mc.Effect }
-    } catch {
-        GHI_LOG "MO_MAN_HINH_UI: lấy Hieu_Ung_Mo lỗi (không blocking): $($_.Exception.Message)" 'WARN'
-    }
-
- $global:W.Add_MouseLeftButtonDown({
+$global:W.Add_MouseLeftButtonDown({
     param($s,$ev)
     # Chỉ kéo cửa sổ khi không phóng to và click đúng vào Window
     if($global:W.WindowState -ne 'Maximized' -and $ev.Source -is [System.Windows.Window]){
@@ -1260,13 +1288,10 @@ function MO_MAN_HINH_UI {
 
 # Nút điều khiển cửa sổ kiểu macOS (đỏ/vàng/xanh)
 # LUỒNG MỚI: XANH = mở OvenRanking (ghi đè toggle phóng to theo yêu cầu) | VÀNG = thu nhỏ | ĐỎ = thoát
-try {
-    GAN_CHAM_MAC { DONG_VE 'RANKING' } {
-        if($global:W.WindowState-eq 'Minimized'){$global:W.WindowState='Maximized'}else{$global:W.WindowState='Minimized'}
-    } { DONG_VE 'EXIT' }
-} catch {
-    GHI_LOG "MO_MAN_HINH_UI: Lỗi gán 3 chấm macOS -- không thể chuyển giao diện: $($_.Exception.Message)" 'ERROR'
-}
+GAN_CHAM_MAC { DONG_VE 'RANKING' } {
+    if($global:W.WindowState-eq 'Minimized'){$global:W.WindowState='Maximized'}else{$global:W.WindowState='Minimized'}
+} { DONG_VE 'EXIT' }
+
 # Nút "Làm Mới Nhanh" (title bar) -- ép làm mới NGAY, không đợi lịch 60 giây.
 # CHỈ áp dụng cho San lượng + QA-HOUR -- Oven KHÔNG còn do nút này điều khiển nữa (đã
 # tách thành cơ chế tự động riêng: FileSystemWatcher + hẹn giờ debounce 5 giây +
